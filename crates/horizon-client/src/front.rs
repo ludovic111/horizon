@@ -1,8 +1,8 @@
 //! The front-end screens in Horizon's menu style (`ui_theme`), laid out like
 //! the launcher: a 200-wide sidebar with the sliding selection (Home,
 //! Singleplayer, Multiplayer, Options), content pages with a page header,
-//! settings rows and 1px dividers, and the launcher's opening (the wordmark,
-//! then the interface). They drive the same state as the classic layouts in
+//! settings rows and 1px dividers. The interface is immediately available while
+//! the backdrop loads. They drive the same state as the classic layouts in
 //! `title` and `multiplayer`; only drawing and hit testing differ. The pause
 //! menu's Horizon layout is `pause`, below.
 use crate::{
@@ -43,43 +43,6 @@ const FIELD_B: u64 = id("mp.field", 1);
 const DONE: u64 = id("mp.done", 0);
 const CANCEL_RETRY: u64 = id("mp.cancel_retry", 0);
 
-/// The launcher's opening (`launcher/src/main.rs`): the wordmark holds over
-/// the backdrop, then the interface comes in. A click or a key skips ahead.
-#[derive(Clone, Copy, Debug)]
-pub struct Opening {
-    started: Instant,
-    reveal: Option<Instant>,
-}
-impl Opening {
-    pub fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            reveal: None,
-        }
-    }
-    /// The reveal's progress, 0 to 1; `ready` says the backdrop is showing.
-    fn phase(&mut self, ready: bool) -> f32 {
-        let held = self.started.elapsed();
-        if self.reveal.is_none()
-            && ((held >= horizon_theme::OPENING_HOLD && ready)
-                || held >= horizon_theme::OPENING_MAX)
-        {
-            self.reveal = Some(Instant::now());
-        }
-        self.reveal.map_or(0.0, |at| {
-            at.elapsed().as_secs_f32() / horizon_theme::OPENING_REVEAL.as_secs_f32()
-        })
-    }
-    pub fn skip(&mut self) {
-        self.reveal.get_or_insert_with(Instant::now);
-    }
-}
-impl Default for Opening {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Which sidebar item a mode belongs to.
 fn page(mode: &Mode) -> usize {
     match mode {
@@ -112,11 +75,9 @@ impl Title {
             self.draw(ui.atlas, ui.batch, ui.cursor, false);
             return;
         }
-        let reveal = self.opening_phase(backdrop >= 1.0);
         if backdrop < 1.0 {
             ui.cold_background(1.0 - backdrop);
         }
-        let shade = t::ease_out_cubic(reveal);
         // The world stays in view on the home page; deeper pages veil it more.
         let veil = if matches!(self.mode, Mode::Main) {
             horizon_theme::HOME_VEIL
@@ -128,84 +89,41 @@ impl Title {
         } else {
             color::FAINT
         };
-        ui.atmosphere(veil, shade);
-        let side = t::ease_out_cubic((reveal - 0.2) / 0.7);
-        let main = t::ease_out_cubic((reveal - 0.35) / 0.65);
-
-        // The sidebar slides in from the left.
-        ui.opacity = side;
-        ui.offset = (-16.0 * (1.0 - side), 0.0);
-        if side > 0.0 {
-            self.sidebar(ui);
-        }
-        // The content rises; each new page fades in and rises 8 over MOVE.
-        let entered = self.entered();
-        let p = t::ease_out_quint(entered.elapsed().as_secs_f32() / t::move_());
-        ui.opacity = main * p;
-        ui.offset = (0.0, 16.0 * (1.0 - main) + 8.0 * (1.0 - p));
-        if main > 0.0 {
-            let x = SIDEBAR + 48.0;
-            let w = (ui.w - x - 48.0).min(760.0);
-            match &self.mode {
-                Mode::Main => self.home(ui, x, w),
-                Mode::Select { worlds, selected } => worlds_page(ui, x, w, worlds, *selected),
-                Mode::Create {
-                    name,
-                    seed,
-                    creative,
-                    focus,
-                    ..
-                } => {
-                    let caret = (self.started.elapsed().as_millis() / 500).is_multiple_of(2);
-                    create_page(ui, x, w, name, seed, *creative, *focus, caret);
-                }
-                Mode::Delete { world } => delete_page(ui, x, w, world),
-                Mode::Error { message, .. } => error_page(ui, x, w, message),
-                Mode::Multiplayer(screen) => {
-                    let caret = (self.started.elapsed().as_millis() / 500).is_multiple_of(2);
-                    multiplayer_page(ui, x, w, screen, caret);
-                }
-                Mode::Edit { .. } | Mode::Backup { .. } => {
-                    unreachable!("World editing uses the classic layout")
-                }
+        ui.atmosphere(veil, 1.0);
+        self.sidebar(ui);
+        // Later navigation retains its motion; the initial page appears immediately.
+        let p = self.entered().map_or(1.0, |at| {
+            t::ease_out_quint(at.elapsed().as_secs_f32() / t::move_())
+        });
+        ui.opacity = p;
+        ui.offset = (0.0, 8.0 * (1.0 - p));
+        let x = SIDEBAR + 48.0;
+        let w = (ui.w - x - 48.0).min(760.0);
+        match &self.mode {
+            Mode::Main => self.home(ui, x, w),
+            Mode::Select { worlds, selected } => worlds_page(ui, x, w, worlds, *selected),
+            Mode::Create {
+                name,
+                seed,
+                creative,
+                focus,
+                ..
+            } => {
+                let caret = (self.started.elapsed().as_millis() / 500).is_multiple_of(2);
+                create_page(ui, x, w, name, seed, *creative, *focus, caret);
+            }
+            Mode::Delete { world } => delete_page(ui, x, w, world),
+            Mode::Error { message, .. } => error_page(ui, x, w, message),
+            Mode::Multiplayer(screen) => {
+                let caret = (self.started.elapsed().as_millis() / 500).is_multiple_of(2);
+                multiplayer_page(ui, x, w, screen, caret);
+            }
+            Mode::Edit { .. } | Mode::Backup { .. } => {
+                unreachable!("World editing uses the classic layout")
             }
         }
         ui.opacity = 1.0;
         ui.offset = (0.0, 0.0);
-        if reveal < 1.0 {
-            // The wordmark rises and fades as the interface comes in.
-            let word = 1.0 - t::ease_out_cubic(reveal / 0.6);
-            ui.opacity = word;
-            let tw = ui.measure(Face::Display, t::WORDMARK, "horizon");
-            let line = (t::WORDMARK * 1.2).round();
-            ui.text_line(
-                Face::Display,
-                t::WORDMARK,
-                line,
-                ((ui.w - tw) / 2.0).round(),
-                (ui.h - line) / 2.0 - 28.0 * (1.0 - word),
-                color::TEXT,
-                "horizon",
-            );
-            ui.opacity = 1.0;
-        }
-    }
-    fn opening_phase(&self, ready: bool) -> f32 {
-        let mut opening = self.opening.get();
-        let phase = opening.as_mut().map_or(1.0, |o| o.phase(ready));
-        self.opening.set(opening.filter(|_| phase < 1.0));
-        phase.min(1.0)
-    }
-    /// A click or key during the opening jumps to the reveal; true if it did.
-    pub fn skip_opening(&self) -> bool {
-        let mut opening = self.opening.get();
-        let skipped = opening.as_mut().is_some_and(|o| {
-            let holding = o.reveal.is_none();
-            o.skip();
-            holding
-        });
-        self.opening.set(opening);
-        skipped
     }
     fn sidebar(&self, ui: &mut Ui) {
         let (h, muted) = (ui.h, ui.muted);
@@ -318,9 +236,6 @@ impl Title {
         x: f32,
         y: f32,
     ) -> Action {
-        if self.skip_opening() {
-            return Action::None;
-        }
         if classic(&self.mode) {
             return self.click(x, y, (batch.width, batch.height)).0;
         }
@@ -1429,6 +1344,46 @@ mod tests {
         match &title.mode {
             Mode::Select { worlds, selected } => selected.map(|i| worlds[i].folder.clone()),
             _ => panic!("not on the world list"),
+        }
+    }
+
+    #[test]
+    fn initial_page_has_no_transition_but_navigation_still_does() {
+        let mut title = Title::new(std::path::PathBuf::new(), std::path::Path::new(""));
+        assert!(title.entered().is_none());
+        title.mode = Mode::Select {
+            worlds: Vec::new(),
+            selected: None,
+        };
+        let entered = title.entered();
+        assert!(entered.is_some());
+        assert_eq!(title.entered(), entered);
+    }
+
+    #[test]
+    fn initial_menu_is_visible_and_clickable_while_backdrop_loads() {
+        let atlas =
+            HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
+        for backdrop in [0.0, 1.0] {
+            let mut title = Title::new(std::path::PathBuf::new(), std::path::Path::new(""));
+            let mut batch = HudBatch::new([1280, 720]);
+            let (rect, density) = {
+                let mut ui = Ui::new(&atlas, &mut batch, (0.0, 0.0));
+                title.draw_horizon(&mut ui, backdrop);
+                assert!(title.entered().is_none(), "initial page must not fade in");
+                assert!(ui.hits.iter().any(|hit| hit.id == PLAY));
+                let options = ui.hits.iter().find(|hit| hit.id == NAV + 3).unwrap();
+                let target = (options.rect, ui.density);
+                ui.finish();
+                target
+            };
+            let k = density / batch.scale;
+            let (x, y) = ((rect[0] + rect[2]) / 2.0 * k, (rect[1] + rect[3]) / 2.0 * k);
+            assert_eq!(
+                title.click_horizon(&atlas, &mut batch, x, y),
+                Action::Options,
+                "the first click must activate the menu, including before backdrop readiness"
+            );
         }
     }
 

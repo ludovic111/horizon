@@ -183,11 +183,6 @@ pub const MOTION: [Motion; 3] = [QUICK, MOVE, ENTER];
 pub const STAGGER: Duration = Duration::from_millis(40);
 pub const RISE: f32 = 8.;
 
-/// The launcher's opening: the wordmark holds, then the interface arrives.
-pub const OPENING_HOLD: Duration = Duration::from_millis(1400);
-pub const OPENING_MAX: Duration = Duration::from_millis(2500);
-pub const OPENING_REVEAL: Duration = Duration::from_millis(800);
-
 /// A CSS `cubic-bezier(x1, y1, x2, y2)` at `t`: solves x for the curve parameter, returns y.
 pub fn bezier([x1, y1, x2, y2]: [f32; 4], t: f32) -> f32 {
     let t = t.clamp(0., 1.);
