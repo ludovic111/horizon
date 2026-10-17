@@ -3406,6 +3406,8 @@ mod tests {
 
     #[test]
     fn classic_video_settings_lead_back_to_horizon_menus() {
+        let previous_style = style();
+        set_style(MenuStyle::Horizon);
         let s = Settings::default();
         let mut ui = OptionsUi::default();
         ui.push(Page::Video);
@@ -3427,5 +3429,6 @@ mod tests {
             crate::options_horizon::SECTIONS[ui.section].name,
             "Interface"
         );
+        set_style(previous_style);
     }
 }
