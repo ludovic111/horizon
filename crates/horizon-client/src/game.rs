@@ -196,7 +196,12 @@ use horizon_world::{
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+        mpsc::{Receiver, TryRecvError},
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 use winit::{
@@ -688,6 +693,23 @@ pub struct Resources {
     /// Enchantments, workstation recipes and brewing (game/stations.rs).
     stations: horizon_client::stations::StationData,
 }
+/// Everything the title and menus draw: the GUI atlas with its font and the
+/// title panorama. Kept apart from the world bundle so the title can appear
+/// before the block sprites, models and gameplay tables are ready.
+pub struct UiResources {
+    /// The GUI, font, particle, map and skin atlas.
+    pub atlas: HudAtlas,
+    /// The title screen's panorama faces.
+    pub panorama: Arc<horizon_client::gfx::panorama::Faces>,
+}
+impl UiResources {
+    pub fn load(root: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            atlas: HudAtlas::build(root)?,
+            panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
+        })
+    }
+}
 /// What a resource pack reload replaces (`Minecraft.reloadResourcePacks`):
 /// block models and sprites with their meshing tables, item models,
 /// translations and the textures read on the CPU. Each game holds its own;
@@ -697,7 +719,6 @@ pub struct PackResources {
     assets: Arc<Assets>,
     context: Arc<WorkerContext>,
     layer_names: Arc<HashMap<u32, String>>,
-    panorama: Arc<horizon_client::gfx::panorama::Faces>,
     /// Item definitions, baked item models and special renderers.
     item_renderer: Arc<horizon_client::item_render::ItemRenderer>,
     names: Arc<Names>,
@@ -736,7 +757,6 @@ impl PackResources {
                 light,
             }),
             assets,
-            panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
             item_renderer: Arc::new(item_renderer),
             names: Arc::new(Names::load(root)),
             clouds: Arc::new(load_clouds(root)),
@@ -773,8 +793,8 @@ struct Game<'a> {
     motion: &'a MotionResources,
     /// This game's resource packs (`reload_packs` replaces them).
     pack: PackResources,
-    /// The GUI, font, particle, map and skin atlas.
-    atlas: HudAtlas,
+    /// The title and menu bundle (GUI atlas, font and panorama).
+    gui: UiResources,
     /// `FogRenderer`'s evolving state.
     fog: horizon_client::fog::FogState,
     screen_fx: horizon_client::screen_effects::ScreenEffects,
@@ -3739,7 +3759,7 @@ impl Game<'_> {
         let (stack, capped) = match drag.and_then(|d| d.slots.get(&slot)) {
             Some(None) => return,
             Some(Some((count, capped))) => {
-                batch.fill(&self.atlas, x, y, 16.0, 16.0, rgba(255, 255, 255, 128));
+                batch.fill(&self.gui.atlas, x, y, 16.0, 16.0, rgba(255, 255, 255, 128));
                 let carried = self
                     .carried
                     .clone()
@@ -3834,10 +3854,10 @@ impl Game<'_> {
             0,
             0,
             &decorations,
-            &self.atlas.font,
+            &self.gui.atlas.font,
         ));
         draws.push(hud_layout::GuiDraw::Pop);
-        hud_layout::paint(batch, &self.atlas, &draws);
+        hud_layout::paint(batch, &self.gui.atlas, &draws);
     }
     fn hud(&mut self, size: [u32; 2]) -> HudBatch {
         let mut batch = self.hud_layers(size);
@@ -3845,7 +3865,7 @@ impl Game<'_> {
         // and the toasts, so it is over everything, menus included.
         self.draw_debug_overlay(&mut batch, size);
         self.frame_graph
-            .draw(self.settings.horizon.overlay, &mut batch, &self.atlas);
+            .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_cursor(&mut batch);
         batch
     }
@@ -3866,12 +3886,12 @@ impl Game<'_> {
             if horizon_client::ui_theme::horizon() {
                 let fade = self.backdrop_fade();
                 let mut ui =
-                    horizon_client::ui_theme::Ui::new(&self.atlas, &mut batch, self.cursor);
+                    horizon_client::ui_theme::Ui::new(&self.gui.atlas, &mut batch, self.cursor);
                 title.draw_horizon(&mut ui, fade);
                 ui.finish();
             } else {
                 title.draw(
-                    &self.atlas,
+                    &self.gui.atlas,
                     &mut batch,
                     self.cursor,
                     self.settings.file.bool("hideSplashTexts"),
@@ -3879,7 +3899,7 @@ impl Game<'_> {
             }
             return batch;
         }
-        let atlas_ptr: *const HudAtlas = &self.atlas;
+        let atlas_ptr: *const HudAtlas = &self.gui.atlas;
         let _ = atlas_ptr;
         if self.remote_overlay(&mut batch) {
             return batch;
@@ -3910,7 +3930,7 @@ impl Game<'_> {
                     hud_layout::full_attack_indicator(a, delay, self.crosshair_living())
                 });
                 let draws = hud_layout::crosshair(wi, hi, attack, full);
-                hud_layout::paint(&mut batch, &self.atlas, &draws);
+                hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
             if !spectator {
                 let inputs = hud_layout::HotbarInputs {
@@ -3922,7 +3942,7 @@ impl Game<'_> {
                     attack: (indicator == 2).then_some(strength),
                 };
                 let draws = hud_layout::hotbar(wi, hi, &inputs);
-                hud_layout::paint(&mut batch, &self.atlas, &draws);
+                hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
                 for d in &draws {
                     if let hud_layout::GuiDraw::Item { slot, x, y, .. } = *d {
                         let stack = if slot == 40 {
@@ -3952,7 +3972,7 @@ impl Game<'_> {
                 && !spectator
                 && let Some(p) = &mut self.player
             {
-                let atlas = &self.atlas;
+                let atlas = &self.gui.atlas;
                 let width = |s: &str| HudBatch::text_width(atlas, s) as i32;
                 let draws = hud_layout::experience(
                     wi,
@@ -4015,13 +4035,13 @@ impl Game<'_> {
         }
         // Hud.extractSleepOverlay: over all health/food bars, under titles and chat.
         let draws = hud_overlays::sleep_overlay(wi, hi, self.sleep_timer as i32);
-        hud_layout::paint(&mut batch, &self.atlas, &draws);
+        hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
         if show_hud {
             self.draw_titles(&mut batch);
             self.draw_scoreboard(&mut batch);
             self.draw_subtitles(&mut batch);
         }
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         if show_hud
             && let Some((text, at)) = &self.message
             && at.elapsed() < Duration::from_secs(3)
@@ -4038,9 +4058,9 @@ impl Game<'_> {
             // PauseScreen(false): only its title, at the top.
             Screen::Paused => {
                 let title = self.translate("menu.paused", "Game Paused");
-                let tw = HudBatch::text_width(&self.atlas, &title);
+                let tw = HudBatch::text_width(&self.gui.atlas, &title);
                 batch.text(
-                    &self.atlas,
+                    &self.gui.atlas,
                     &title,
                     ((batch.width / 2.0).floor() - (tw / 2.0).floor()).floor(),
                     10.0,
@@ -4258,7 +4278,7 @@ impl Game<'_> {
             let (sx, sy) = self.slot_position(i);
             if i == 504 && self.offhand.is_none() {
                 batch.sprite(
-                    &self.atlas,
+                    &self.gui.atlas,
                     "gui/sprites/container/slot/shield",
                     ox + sx,
                     oy + sy,
@@ -4267,7 +4287,7 @@ impl Game<'_> {
             if (500..504).contains(&i) && self.armor[i - 500].is_none() {
                 let icon = ["helmet", "chestplate", "leggings", "boots"][i - 500];
                 batch.sprite(
-                    &self.atlas,
+                    &self.gui.atlas,
                     &format!("gui/sprites/container/slot/{icon}"),
                     ox + sx,
                     oy + sy,
@@ -4283,7 +4303,7 @@ impl Game<'_> {
         }
         let (ox, oy) = self.inventory_origin(batch);
         {
-            let atlas = &self.atlas;
+            let atlas = &self.gui.atlas;
             batch.fill(
                 atlas,
                 0.0,
@@ -4407,7 +4427,7 @@ impl Game<'_> {
         if let Some(slot) = self.slot_at(batch, self.cursor.0, self.cursor.1) {
             let (sx, sy) = self.slot_position(slot);
             batch.fill(
-                &self.atlas,
+                &self.gui.atlas,
                 ox + sx,
                 oy + sy,
                 16.0,
@@ -5433,7 +5453,7 @@ impl Game<'_> {
                     m.height(),
                     camera,
                     fire_yaw,
-                    &self.atlas.sprites,
+                    &self.gui.atlas.sprites,
                     self.world.light(
                         at.x.floor() as i32,
                         at.y.floor() as i32,
@@ -5455,7 +5475,7 @@ impl Game<'_> {
                 p.dimensions.height,
                 camera,
                 fire_yaw,
-                &self.atlas.sprites,
+                &self.gui.atlas.sprites,
                 self.world.light(
                     feet.x.floor() as i32,
                     feet.y.floor() as i32,
@@ -5478,7 +5498,7 @@ impl Game<'_> {
                     0.25,
                     camera,
                     fire_yaw,
-                    &self.atlas.sprites,
+                    &self.gui.atlas.sprites,
                     self.world.light(
                         at.x.floor() as i32,
                         at.y.floor() as i32,
@@ -5497,7 +5517,7 @@ impl Game<'_> {
                     1.975 * scale,
                     camera,
                     fire_yaw,
-                    &self.atlas.sprites,
+                    &self.gui.atlas.sprites,
                     self.world.light(
                         stand.position.x.floor() as i32,
                         stand.position.y.floor() as i32,
@@ -5522,7 +5542,7 @@ impl Game<'_> {
         self.name_tag_geometry(camera, alpha, &mut out, &mut see_through);
         self.see_through_vertices = see_through;
         // Entity shadows (EntityRenderer.extractShadow).
-        if let Some(sprite) = self.atlas.sprites.get("misc/shadow").copied() {
+        if let Some(sprite) = self.gui.atlas.sprites.get("misc/shadow").copied() {
             let ambient = if self.dim == Dim::Nether { 0.1 } else { 0.0 };
             let darken = self.sky_darken();
             let a = alpha;
@@ -5577,7 +5597,7 @@ impl Game<'_> {
                 game_time: self.world.game_time,
                 max_y: self.dim.max_y(),
                 world: &self.world,
-                sprites: &self.atlas.sprites,
+                sprites: &self.gui.atlas.sprites,
                 nether: self.dim == Dim::Nether,
                 lid: &lid,
                 sign: &|p| match self.world.block_entities.get(&(p[0], p[1], p[2])) {
@@ -5585,7 +5605,7 @@ impl Game<'_> {
                     _ => None,
                 },
                 banner: &|p| self.banner_layers_at(p),
-                glyph: &|c| self.atlas.glyph_cell(c),
+                glyph: &|c| self.gui.atlas.glyph_cell(c),
             };
             // Block entities outside the view frustum are skipped (with a
             // block of margin for models larger than their block).
@@ -5632,7 +5652,7 @@ impl Game<'_> {
             }
             if let Some(mining) = &self.mining
                 && mining.progress > 0.0
-                && self.atlas.sprites.contains_key(&format!(
+                && self.gui.atlas.sprites.contains_key(&format!(
                     "block/destroy_stage_{}",
                     ((mining.progress * 10.0) as u32).min(9)
                 ))
@@ -5647,6 +5667,7 @@ impl Game<'_> {
         }
         // Experience orbs (ExperienceOrbRenderer): pulsing billboards from a 4x4 icon sheet.
         if let Some(r) = self
+            .gui
             .atlas
             .sprites
             .get("entity/experience/experience_orb")
@@ -5759,7 +5780,7 @@ impl Game<'_> {
             &|b| world.light(b[0], b[1], b[2]),
             &mut out,
         );
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         // Breaking progress overlay (destroy_stage_0..9).
         if let Some(m) = &self.mining
             && m.progress > 0.0
@@ -6144,7 +6165,7 @@ impl Game<'_> {
     /// SkyRenderer.renderSunMoonAndStars: bodies on a frame rotated Y -90 then X by angle.
     fn celestial_geometry(&self, sky: &horizon_client::environment::Sky) -> Vec<Vertex> {
         let mut out = Vec::new();
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         let frame = |angle: f32| {
             glam::Mat4::from_rotation_y((-90.0f32).to_radians())
                 * glam::Mat4::from_rotation_x(angle.to_radians())
@@ -7644,7 +7665,13 @@ impl Game<'_> {
                 let Some(arm) = self.res.player_arm.clone() else {
                     continue;
                 };
-                let Some(r) = self.atlas.sprites.get("entity/player/wide/steve").copied() else {
+                let Some(r) = self
+                    .gui
+                    .atlas
+                    .sprites
+                    .get("entity/player/wide/steve")
+                    .copied()
+                else {
                     continue;
                 };
                 // renderPlayerArm (right arm)
@@ -7768,38 +7795,24 @@ impl Game<'_> {
         }
         out
     }
-    /// The renderer for the window, with the current block sprites, shared
+    /// The renderer for the window, with the current block sprites, GUI
     /// atlas and world border texture.
     fn new_renderer(&self, window: Arc<Window>) -> Result<Renderer> {
-        self.renderer_for(window, &self.pack, &self.atlas)
+        self.renderer_for(window, &self.pack, &self.gui)
     }
     fn renderer_for(
         &self,
         window: Arc<Window>,
         pack: &PackResources,
-        atlas: &HudAtlas,
+        gui: &UiResources,
     ) -> Result<Renderer> {
-        let assets = &pack.assets;
-        let mut renderer = pollster::block_on(Renderer::new(
+        build_renderer(
             window,
             self.options.offscreen,
-            &assets.pixels,
-            assets.sprite_size,
-            assets.sprite_minimum_size,
-            assets.texture_layers,
-            &assets.sprite_mips,
-            &assets.animations,
-            (&atlas.pixels, atlas.width, atlas.height),
-            (&pack.forcefield.2, pack.forcefield.0),
-            &pack.panorama,
+            pack,
+            gui,
             self.renderer.as_ref(),
-        ))?;
-        renderer.hud.fire_animations = atlas
-            .fire_animations
-            .iter()
-            .map(|(rect, animation)| (*rect, animation.clone(), usize::MAX))
-            .collect();
-        Ok(renderer)
+        )
     }
     fn apply_settings(&mut self) {
         if let Some(r) = &self.renderer {
@@ -7914,7 +7927,7 @@ impl Game<'_> {
         if intensity <= 0.0 {
             return;
         }
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         let (Some(rain_tex), Some(snow_tex)) = (
             atlas.sprites.get("environment/rain").copied(),
             atlas.sprites.get("environment/snow").copied(),
@@ -8110,7 +8123,7 @@ impl Game<'_> {
     }
     /// Vanilla tooltip: dark box with a purple gradient border.
     fn tooltip(&self, batch: &mut HudBatch, text: &str, x: f32, y: f32) {
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         let w = HudBatch::text_width(atlas, text);
         let (x, y) = (x + 12.0, y - 12.0);
         batch.fill(atlas, x - 3.0, y - 4.0, w + 6.0, 16.0, rgba(16, 0, 16, 240));
@@ -8132,7 +8145,7 @@ impl Game<'_> {
             )
         };
         batch.fill(
-            &self.atlas,
+            &self.gui.atlas,
             0.0,
             0.0,
             batch.width,
@@ -8143,7 +8156,7 @@ impl Game<'_> {
         for (i, t) in tabs.iter().enumerate() {
             if i != selected {
                 let (tx, ty) = Creative::tab_position(t);
-                batch.sprite(&self.atlas, &tab_sprite(t, false), ox + tx, oy + ty);
+                batch.sprite(&self.gui.atlas, &tab_sprite(t, false), ox + tx, oy + ty);
             }
         }
         let background = if tab.search {
@@ -8153,13 +8166,13 @@ impl Game<'_> {
         } else {
             "gui/container/creative_inventory/tab_items"
         };
-        if let Some(mut r) = self.atlas.sprites.get(background).copied() {
+        if let Some(mut r) = self.gui.atlas.sprites.get(background).copied() {
             r.u1 = r.u0 + (r.u1 - r.u0) * Creative::WIDTH / r.w as f32;
             r.v1 = r.v0 + (r.v1 - r.v0) * Creative::HEIGHT / r.h as f32;
             batch.rect_uv(ox, oy, Creative::WIDTH, Creative::HEIGHT, r, u32::MAX);
         }
         let (tx, ty) = Creative::tab_position(&tab);
-        batch.sprite(&self.atlas, &tab_sprite(&tab, true), ox + tx, oy + ty);
+        batch.sprite(&self.gui.atlas, &tab_sprite(&tab, true), ox + tx, oy + ty);
         for t in &tabs {
             let (tx, ty) = Creative::tab_position(t);
             let stack = ItemStack {
@@ -8175,7 +8188,7 @@ impl Game<'_> {
                 oy + ty + if t.top { 9.0 } else { 7.0 },
             );
         }
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         if !tab.inventory {
             batch.text(
                 atlas,
@@ -8217,7 +8230,7 @@ impl Game<'_> {
             if Self::creative_trash_hovered(batch, self.cursor) {
                 let (x, y) = Creative::TRASH_POSITION;
                 batch.fill(
-                    &self.atlas,
+                    &self.gui.atlas,
                     ox + x,
                     oy + y,
                     16.0,
@@ -8228,7 +8241,7 @@ impl Game<'_> {
             if let Some(slot) = self.slot_at(batch, self.cursor.0, self.cursor.1) {
                 let (x, y) = self.slot_position(slot);
                 batch.fill(
-                    &self.atlas,
+                    &self.gui.atlas,
                     ox + x,
                     oy + y,
                     16.0,
@@ -8251,7 +8264,7 @@ impl Game<'_> {
                         && self.cursor.1 >= y
                         && self.cursor.1 < y + 16.0
                     {
-                        batch.fill(&self.atlas, x, y, 16.0, 16.0, rgba(255, 255, 255, 128));
+                        batch.fill(&self.gui.atlas, x, y, 16.0, 16.0, rgba(255, 255, 255, 128));
                         hovered = Some(stack.clone());
                     }
                 }
@@ -8277,7 +8290,7 @@ impl Game<'_> {
                 "gui/sprites/container/creative_inventory/scroller_disabled"
             };
             batch.sprite(
-                &self.atlas,
+                &self.gui.atlas,
                 scroller,
                 ox + Creative::SCROLL_X,
                 oy + Creative::SCROLL_Y + self.creative_screen.scroller_offset(),
@@ -8740,7 +8753,7 @@ impl Game<'_> {
             clouds: ((!title || live)
                 && self.dim == Dim::Overworld
                 && horizon_client::clouds::visible(&self.settings.clouds, sky.cloud_color[3]))
-            .then(|| self.atlas.sprites.get("horizon/white"))
+            .then(|| self.gui.atlas.sprites.get("horizon/white"))
             .flatten()
             .map(|white| horizon_client::clouds::Input {
                 texture: &self.pack.clouds,
@@ -8770,14 +8783,15 @@ impl Game<'_> {
                 .mining
                 .as_ref()
                 .and_then(|m| {
-                    self.atlas.sprites.get(&format!(
+                    self.gui.atlas.sprites.get(&format!(
                         "block/destroy_stage_{}",
                         ((m.progress * 10.0) as u32).min(9)
                     ))
                 })
                 .map_or([0.0; 4], |r| [r.u0, r.v0, r.u1 - r.u0, r.v1 - r.v0]),
             end_portal_sprites: ["environment/end_sky", "entity/end_portal/end_portal"].map(|n| {
-                self.atlas
+                self.gui
+                    .atlas
                     .sprites
                     .get(n)
                     .map_or([0.0; 4], |r| [r.u0, r.v0, r.u1 - r.u0, r.v1 - r.v0])
@@ -8837,7 +8851,7 @@ impl Game<'_> {
         reason: horizon_client::level_loading::Reason,
     ) {
         use horizon_client::level_loading::{self, Reason, STATUS_RADIUS};
-        let atlas = &self.atlas;
+        let atlas = &self.gui.atlas;
         let (w, h) = (batch.width, batch.height);
         match reason {
             // The panorama and its blur are drawn by the renderer.
@@ -9348,7 +9362,7 @@ impl ApplicationHandler for Game<'_> {
                             && !horizon_client::ui_theme::horizon()
                         {
                             title.drag(self.cursor, (b.width, b.height));
-                            title.drag_field(&self.atlas, self.cursor.0);
+                            title.drag_field(&self.gui.atlas, self.cursor.0);
                         }
                         if self.dragging && self.screen == Screen::Options {
                             let _ = b;
@@ -9453,7 +9467,7 @@ impl ApplicationHandler for Game<'_> {
                         .map(|r| [r.config.width, r.config.height])
                         .unwrap_or([1, 1]);
                     let mut b = HudBatch::new(size);
-                    let atlas = &self.atlas;
+                    let atlas = &self.gui.atlas;
                     let shift = self.has_shift_down();
                     let (action, sound) = self.title.as_mut().map_or((Action::None, false), |t| {
                         if horizon_client::ui_theme::horizon() {
@@ -9997,7 +10011,7 @@ impl<'a> Game<'a> {
     fn new(
         res: &'a Arc<Resources>,
         pack: PackResources,
-        atlas: HudAtlas,
+        gui: UiResources,
         options: Options,
         settings: Settings,
         audio: Audio,
@@ -10031,13 +10045,13 @@ impl<'a> Game<'a> {
         let inventory = vec![None; 36];
         let now = Instant::now();
         let look = options.look;
-        let particles = horizon_client::particles::ParticleEngine::new(&root, &atlas.sprites);
+        let particles = horizon_client::particles::ParticleEngine::new(&root, &gui.atlas.sprites);
         Ok(Game {
             res: res.clone(),
             collision: &res.collision,
             motion: &res.motion,
             pack,
-            atlas,
+            gui,
             fog: Default::default(),
             screen_fx: Default::default(),
             world,
@@ -10313,41 +10327,83 @@ impl<'a> Game<'a> {
     }
 }
 
-pub fn run() -> Result<()> {
-    let Some(mut options) = Options::read()? else {
-        return Ok(());
-    };
-    if options.dedicated.is_some() && !dedicated::preflight(&mut options)? {
-        return Ok(());
+/// The data the background loader produces for `Game::new`.
+struct Loaded {
+    root: PathBuf,
+    pack_error: Option<String>,
+    resources: Resources,
+    pack: PackResources,
+    gui: UiResources,
+}
+
+/// The loader's checkpoints, in order; the loading screen reports them.
+const STAGES: u32 = 9;
+const STAGE_LINES: [&str; 9] = [
+    "Loading assets",
+    "Loading block facts",
+    "Loading items",
+    "Loading biomes",
+    "Loading pack tables",
+    "Loading atlas",
+    "Loading collision",
+    "Loading resources",
+    "Starting audio",
+];
+
+/// The background loader's checkpoint, read by the loading screen each frame.
+#[derive(Clone)]
+struct Progress(Arc<AtomicU32>);
+impl Progress {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU32::new(0)))
     }
-    let started = Instant::now();
-    horizon_client::spans::enable(options.spikes.is_some());
-    let vanilla_root = options.resources.clone();
-    let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
-    // Snapshots of derived tables live in the game folder, never beside the
-    // shared resources.
-    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    fn set(&self, stage: u32) {
+        self.0.store(stage, Ordering::Relaxed);
+    }
+    fn fraction(&self) -> f32 {
+        self.0.load(Ordering::Relaxed) as f32 / (STAGES - 1) as f32
+    }
+    fn line(&self) -> &'static str {
+        STAGE_LINES[(self.0.load(Ordering::Relaxed) as usize).min(STAGE_LINES.len() - 1)]
+    }
+}
+
+/// Harness and dedicated runs keep the fully-synchronous startup so their
+/// output stays byte-identical; only an ordinary launch shows the window first.
+fn synchronous_startup(options: &Options) -> bool {
+    let classic = std::env::var("HORIZON_MENU_STYLE").ok().as_deref() == Some("classic");
+    options.frames.is_some()
+        || options.world_frames.is_some()
+        || options.benchmark.is_some()
+        || options.control.is_some()
+        || options.dedicated.is_some()
+        || classic
+        || std::env::var_os("HORIZON_DISPENSE_FIXTURE").is_some()
+        || std::env::var_os("HORIZON_SCULK_FIXTURE").is_some()
+        || std::env::var_os("HORIZON_COMMAND_SCRIPT").is_some()
+        || std::env::var_os("HORIZON_NET_REPORT").is_some()
+}
+
+/// The current loading sequence, unchanged, as a function so the synchronous
+/// launch can run it on the main thread and an ordinary launch on a worker.
+/// `on_stage` reports [`STAGES`] checkpoints to the loading screen.
+fn load_resources(
+    mut root: PathBuf,
+    vanilla_root: &std::path::Path,
+    settings: &Settings,
+    started: Instant,
+    on_stage: &(dyn Fn(u32) + Sync),
+) -> Result<Loaded> {
     let mut pack_error = None;
-    options.resources = packs::startup_root(&vanilla_root, &early_settings.resource_packs)
-        .unwrap_or_else(|e| {
-            log::warn!("Horizon: resource packs not applied: {e}");
-            pack_error = Some(e.to_string());
-            vanilla_root.clone()
-        });
-    options.resources = mods::content_root(
-        &options.resources,
-        &early_settings.mods.enabled,
-        &options.dev_mods,
-    );
-    let assets = match Assets::load(&options.resources) {
+    let assets = match Assets::load(&root) {
         Ok(assets) => assets,
         // Minecraft.rollbackResourcePacks: the packs break loading, start
         // with the game's own resources.
-        Err(e) if options.resources != vanilla_root => {
+        Err(e) if root != vanilla_root => {
             log::warn!("Horizon: resource packs failed to load ({e}); using the default resources");
             pack_error = Some(e.to_string());
-            options.resources = vanilla_root.clone();
-            Assets::load(&vanilla_root)?
+            root = vanilla_root.to_path_buf();
+            Assets::load(vanilla_root)?
         }
         Err(e) => {
             return Err(format!(
@@ -10356,9 +10412,9 @@ pub fn run() -> Result<()> {
             .into());
         }
     };
-    let root = options.resources.clone();
     let assets = Arc::new(assets);
     log::info!("load assets: {:.2}s", started.elapsed().as_secs_f32());
+    on_stage(0);
     let behaviour_json: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open(root.join("block-behaviours.json"))?,
     ))?;
@@ -10367,23 +10423,28 @@ pub fn run() -> Result<()> {
     let mob_data = horizon_client::mobs::MobData::load(&root, &facts);
     horizon_client::mobs::trial_spawner::load_registry(&root);
     log::info!("load facts: {:.2}s", started.elapsed().as_secs_f32());
+    on_stage(1);
     let items = Items::load(&root, assets.registry, &facts)?;
     log::info!("load items: {:.2}s", started.elapsed().as_secs_f32());
+    on_stage(2);
     let recipes = Recipes::load(&root, &items)?;
     let transformers = horizon_client::block_transform::Transformers::load(&root, assets.registry)?;
     let biomes = Arc::new(Biomes::load(&root)?);
     let environment = Environment::load(&root)?;
     log::info!("load biomes+env: {:.2}s", started.elapsed().as_secs_f32());
+    on_stage(3);
     let light = Arc::new(LightTables::load(&root, assets.registry, &facts)?);
     let pack = PackResources::load(&root, assets.clone(), &facts, biomes.clone(), light)?;
     log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
-    let atlas = HudAtlas::build(&root)?;
+    on_stage(4);
+    let gui = UiResources::load(&root)?;
     horizon_client::ui::load_metadata(&root);
     horizon_client::lang::set(horizon_client::lang::Language::load(
         &[&root],
-        &early_settings.language,
+        &settings.language,
     ));
     log::info!("load atlas: {:.2}s", started.elapsed().as_secs_f32());
+    on_stage(5);
     let registry_owner = assets.clone();
     let collision = collisions::load(&root, registry_owner.registry)?;
     let motion = MotionResources::load(&root, &registry_owner)?;
@@ -10391,7 +10452,8 @@ pub fn run() -> Result<()> {
         "load collision+motion: {:.2}s",
         started.elapsed().as_secs_f32()
     );
-    let threads = early_settings.horizon.worker_threads();
+    on_stage(6);
+    let threads = settings.horizon.worker_threads();
     log::info!(
         "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
         started.elapsed().as_secs_f32(),
@@ -10400,16 +10462,11 @@ pub fn run() -> Result<()> {
         biomes.list.len(),
         threads
     );
-    let audio = if options.dedicated.is_some() {
-        Audio::silent(&root)
-    } else {
-        Audio::new(&root)
-    };
     let stations = horizon_client::stations::StationData::load(&root, &items);
     let animate =
         horizon_client::animate_tick::AnimateTables::load(&root, registry_owner.registry, &biomes)?;
     let fog = horizon_client::fog::FogTables::load(&root, &biomes);
-    let resources = Arc::new(Resources {
+    let resources = Resources {
         stations,
         facts,
         items,
@@ -10446,11 +10503,160 @@ pub fn run() -> Result<()> {
         player_type: perspective::player_type(&root),
         player_arm: horizon_client::mobs::load_model(&root, "minecraft:player#main")
             .and_then(|m| m.children.into_iter().find(|c| c.name == "right_arm")),
-    });
+    };
     // Both inputs are needed only while constructing the behaviour tables.
     // Release their owned JSON/Arc buffers before entering the long-lived game loop.
     drop(gameplay_projection);
     drop(behaviour_json);
+    on_stage(7);
+    Ok(Loaded {
+        root,
+        pack_error,
+        resources,
+        pack,
+        gui,
+    })
+}
+
+/// The renderer from a pack's block sprites, its shared atlas and its border
+/// texture; `previous` shares the device and window surface with an old one.
+fn build_renderer(
+    window: Arc<Window>,
+    offscreen: bool,
+    pack: &PackResources,
+    gui: &UiResources,
+    previous: Option<&Renderer>,
+) -> Result<Renderer> {
+    let assets = &pack.assets;
+    let atlas = &gui.atlas;
+    let mut renderer = pollster::block_on(Renderer::new(
+        window,
+        offscreen,
+        &assets.pixels,
+        assets.sprite_size,
+        assets.sprite_minimum_size,
+        assets.texture_layers,
+        &assets.sprite_mips,
+        &assets.animations,
+        (&atlas.pixels, atlas.width, atlas.height),
+        (&pack.forcefield.2, pack.forcefield.0),
+        &gui.panorama,
+        previous,
+    ))?;
+    renderer.hud.fire_animations = atlas
+        .fire_animations
+        .iter()
+        .map(|(rect, animation)| (*rect, animation.clone(), usize::MAX))
+        .collect();
+    Ok(renderer)
+}
+
+/// The loading screen's renderer: the real HUD atlas and font over one opaque
+/// white block-sprite layer, an empty border texture and an empty panorama.
+fn loading_renderer(
+    window: Arc<Window>,
+    offscreen: bool,
+    atlas: Option<&HudAtlas>,
+) -> Result<Renderer> {
+    static FORCEFIELD: [u8; 4] = [0; 4];
+    static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
+    let panorama = horizon_client::gfx::panorama::Faces {
+        size: 1,
+        pixels: [0u8; 4].repeat(6),
+    };
+    let (pixels, width, height) = match atlas {
+        Some(atlas) => (atlas.pixels.as_slice(), atlas.width, atlas.height),
+        None => (EMPTY_HUD.as_slice(), 1, 1),
+    };
+    let mut renderer = pollster::block_on(Renderer::new(
+        window,
+        offscreen,
+        &[255, 255, 255, 255],
+        1,
+        1,
+        1,
+        &[],
+        &[],
+        (pixels, width, height),
+        (&FORCEFIELD[..], 1),
+        &panorama,
+        None,
+    ))?;
+    if let Some(atlas) = atlas {
+        renderer.hud.fire_animations = atlas
+            .fire_animations
+            .iter()
+            .map(|(rect, animation)| (*rect, animation.clone(), usize::MAX))
+            .collect();
+    }
+    Ok(renderer)
+}
+
+/// A title-shaped frame: black clear and panorama, only the HUD is drawn.
+fn loading_frame(hud: &HudBatch) -> Frame<'_> {
+    Frame {
+        camera: glam::DVec3::new(0.5, 100.0, 0.5),
+        yaw: 0.0,
+        pitch: 10.0,
+        fov_degrees: 85.0,
+        bob: glam::Mat4::IDENTITY,
+        sky: horizon_client::environment::Sky::default(),
+        distance: 12.0,
+        depth_far: 1000.0,
+        underwater: false,
+        cave_culling: false,
+        title: true,
+        skybox: false,
+        end_sky: false,
+        environment_fog: None,
+        water_fog: [0.0; 3],
+        fog: None,
+        dark_disc: false,
+        outline: Vec::new(),
+        outline_after_terrain: false,
+        debug_lines: &[],
+        debug_lines_on_top: &[],
+        debug_crosshair: &[],
+        hud,
+        nether_lighting: false,
+        entities: &[],
+        clouds: None,
+        additive: &[],
+        see_through: &[],
+        celestial: &[],
+        hand: &[],
+        hand_fov_degrees: 70.0,
+        screen: &[],
+        border: None,
+        game_time: 0.0,
+        shader_game_time: 0.0,
+        end_portal_sprites: [[0.0; 4]; 2],
+        crumbling_sprite: [0.0; 4],
+        ticks: 0,
+        darkness: (0.0, 0.0),
+        night_vision: 0.0,
+        block_flicker: 0.0,
+        post: None,
+        menu_blur: None,
+        shader: Default::default(),
+    }
+}
+
+/// The post-load setup once the resources are ready: `Game::new` and the
+/// options, packs, mods, control socket, benchmark and world selection the
+/// old `run` did after loading. `None` means a harness or dedicated run
+/// finished here instead.
+#[allow(clippy::too_many_arguments)]
+fn start_game<'a>(
+    res: &'a Arc<Resources>,
+    pack: PackResources,
+    gui: UiResources,
+    options: Options,
+    pack_error: Option<String>,
+    audio: Audio,
+    vanilla_root: PathBuf,
+    started: Instant,
+) -> Result<Option<Game<'a>>> {
     let mut settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
     horizon_client::ui_theme::load_preferences(&std::env::current_dir()?);
     // Scripted and frame-limited runs (the parity harnesses) see vanilla's
@@ -10463,7 +10669,7 @@ pub fn run() -> Result<()> {
     if let Some(d) = options.distance_override {
         settings.render_distance = d;
     }
-    let mut game = Game::new(&resources, pack, atlas, options, settings, audio)?;
+    let mut game = Game::new(res, pack, gui, options, settings, audio)?;
     game.ui.vanilla_root = vanilla_root;
     if let Some(error) = pack_error {
         game.open_options_at(true, horizon_client::options_ui::Page::Packs);
@@ -10513,13 +10719,16 @@ pub fn run() -> Result<()> {
         );
     }
     if let Ok(spec) = std::env::var("HORIZON_DISPENSE_FIXTURE") {
-        return game.dispense_fixture(&spec);
+        game.dispense_fixture(&spec)?;
+        return Ok(None);
     }
     if let Ok(spec) = std::env::var("HORIZON_SCULK_FIXTURE") {
-        return game.sculk_fixture(&spec);
+        game.sculk_fixture(&spec)?;
+        return Ok(None);
     }
     if game.options.dedicated.is_some() {
-        return game.run_dedicated();
+        game.run_dedicated()?;
+        return Ok(None);
     }
     match game.options.world.clone() {
         _ if game.options.server.is_some() => {
@@ -10529,7 +10738,8 @@ pub fn run() -> Result<()> {
             );
             game.connect_server(&address, &name)?;
             if let Some(report) = std::env::var_os("HORIZON_NET_REPORT") {
-                return game.run_net_harness(report.as_ref());
+                game.run_net_harness(report.as_ref())?;
+                return Ok(None);
             }
         }
         Some(folder) => {
@@ -10555,9 +10765,13 @@ pub fn run() -> Result<()> {
         std::env::var_os("HORIZON_COMMAND_SCRIPT"),
         std::env::var_os("HORIZON_COMMAND_OUTPUT"),
     ) {
-        return game.run_command_harness(script.as_ref(), output.as_ref());
+        game.run_command_harness(script.as_ref(), output.as_ref())?;
+        return Ok(None);
     }
-    EventLoop::new()?.run_app(&mut game)?;
+    Ok(Some(game))
+}
+
+fn write_report(game: &Game<'_>) -> Result<()> {
     if let Some(path) = &game.options.report {
         let report = serde_json::json!({
             "frames": game.frames,
@@ -10570,8 +10784,384 @@ pub fn run() -> Result<()> {
         });
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
-    if let Some(e) = game.error {
+    Ok(())
+}
+
+fn run_event_loop(mut game: Game<'_>) -> Result<()> {
+    EventLoop::new()?.run_app(&mut game)?;
+    write_report(&game)?;
+    if let Some(e) = game.error.take() {
         return Err(e);
+    }
+    Ok(())
+}
+
+/// The loading screen's state while the worker loads the resources.
+struct Loading {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    atlas: Option<HudAtlas>,
+    settings: Settings,
+    fullscreen: horizon_client::window::FullscreenState,
+    options: Option<Options>,
+    vanilla_root: PathBuf,
+    pack_error: Option<String>,
+    started: Instant,
+    progress: Progress,
+    receiver: Receiver<std::result::Result<Loaded, String>>,
+    loaded: Option<std::result::Result<Loaded, String>>,
+    handle: Option<JoinHandle<()>>,
+    shown: bool,
+    error: Option<Box<dyn std::error::Error>>,
+}
+impl Loading {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        // The Window constructor: created fullscreen when options.txt says so.
+        let fullscreen = self.settings.fullscreen;
+        self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
+        let attributes = Window::default_attributes()
+            .with_title("Horizon")
+            .with_window_icon(horizon_client::window::icon());
+        // Wayland names the window by its app id, which the horizon.desktop entry matches.
+        #[cfg(target_os = "linux")]
+        let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            attributes, "horizon", "horizon",
+        );
+        let window = match event_loop.create_window(
+            attributes
+                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+                .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None))),
+        ) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.error = Some(e.into());
+                event_loop.exit();
+                return;
+            }
+        };
+        let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
+        match loading_renderer(window.clone(), offscreen, self.atlas.as_ref()) {
+            Ok(r) => self.renderer = Some(r),
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+                return;
+            }
+        }
+        if let Some(r) = &self.renderer {
+            self.settings
+                .clamp_gui_scale([r.config.width as i32, r.config.height as i32]);
+        }
+        horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+        self.window = Some(window);
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.window.as_ref().is_none_or(|w| w.id() != id) {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(r) = &mut self.renderer {
+                    r.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => self.draw(),
+            _ => {}
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.loaded.is_none() {
+            match self.receiver.try_recv() {
+                Ok(result) => self.loaded = Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(handle) = self.handle.take() {
+                        let _ = handle.join();
+                    }
+                    self.error = Some("resource loader stopped before finishing".into());
+                    event_loop.exit();
+                    return;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(w) = &self.window {
+            if self.options.as_ref().is_some_and(|o| o.offscreen) {
+                self.draw();
+            } else {
+                w.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+    }
+    fn draw(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let size = [renderer.config.width, renderer.config.height];
+        let mut batch = HudBatch::new(size);
+        if let Some(atlas) = &self.atlas {
+            horizon_client::level_loading::draw_progress(
+                &mut batch,
+                atlas,
+                self.progress.line(),
+                self.progress.fraction(),
+            );
+        }
+        let frame = loading_frame(&batch);
+        if let Err(e) = renderer.render(&frame) {
+            log::warn!("Horizon: loading screen frame failed: {e}");
+        }
+        if !self.shown {
+            self.shown = true;
+            log::info!(
+                "Horizon: loading screen shown after {} ms",
+                self.started.elapsed().as_millis()
+            );
+        }
+    }
+    fn finish(&mut self, loaded: Loaded) -> Result<Option<Game<'static>>> {
+        let mut options = self.options.take().ok_or("loading already finished")?;
+        options.resources = loaded.root.clone();
+        self.progress.set(STAGES - 1);
+        // Audio is created on the main thread, after the join.
+        let audio = if options.dedicated.is_some() {
+            Audio::silent(&options.resources)
+        } else {
+            Audio::new(&options.resources)
+        };
+        let window = self.window.clone().ok_or("window closed")?;
+        // Keep the loader's device and swap in the real textures in one step.
+        if let Some(renderer) = &mut self.renderer {
+            renderer.release_surface();
+        }
+        let renderer = build_renderer(
+            window.clone(),
+            options.offscreen,
+            &loaded.pack,
+            &loaded.gui,
+            self.renderer.as_ref(),
+        )?;
+        let pack_error = loaded.pack_error.or_else(|| self.pack_error.take());
+        // The game borrows its shared resources for the process's lifetime,
+        // like the single copy an integrated server would share.
+        let res: &'static Arc<Resources> = Box::leak(Box::new(Arc::new(loaded.resources)));
+        let Some(mut game) = start_game(
+            res,
+            loaded.pack,
+            loaded.gui,
+            options,
+            pack_error,
+            audio,
+            self.vanilla_root.clone(),
+            self.started,
+        )?
+        else {
+            return Ok(None);
+        };
+        game.window = Some(window);
+        game.renderer = Some(renderer);
+        game.fullscreen = self.fullscreen;
+        game.apply_settings();
+        game.previous = Instant::now();
+        Ok(Some(game))
+    }
+}
+
+/// The application: the loading screen until the resources are ready, then
+/// the game itself, on the same event loop and window.
+enum App {
+    Loading(Box<Loading>),
+    Ready(Box<Game<'static>>),
+}
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(loading) => loading.resumed(event_loop),
+            App::Ready(game) => game.resumed(event_loop),
+        }
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        match self {
+            App::Loading(loading) => loading.window_event(event_loop, id, event),
+            App::Ready(game) => game.window_event(event_loop, id, event),
+        }
+    }
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, id: DeviceId, event: DeviceEvent) {
+        if let App::Ready(game) = self {
+            game.device_event(event_loop, id, event);
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        enum Step {
+            Waiting,
+            Ready(Box<Game<'static>>),
+            Done,
+            Failed(Box<dyn std::error::Error>),
+        }
+        let step = match self {
+            App::Ready(game) => {
+                game.about_to_wait(event_loop);
+                return;
+            }
+            App::Loading(loading) => {
+                loading.about_to_wait(event_loop);
+                if loading.error.is_some() {
+                    event_loop.exit();
+                    return;
+                }
+                match loading.loaded.take() {
+                    None => Step::Waiting,
+                    Some(Err(e)) => Step::Failed(e.into()),
+                    Some(Ok(loaded)) => match loading.finish(loaded) {
+                        Ok(Some(game)) => Step::Ready(Box::new(game)),
+                        Ok(None) => Step::Done,
+                        Err(e) => Step::Failed(e),
+                    },
+                }
+            }
+        };
+        match step {
+            Step::Waiting => {}
+            Step::Ready(game) => *self = App::Ready(game),
+            Step::Done => event_loop.exit(),
+            Step::Failed(e) => {
+                if let App::Loading(loading) = self {
+                    loading.error = Some(e);
+                }
+                event_loop.exit();
+            }
+        }
+    }
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        if let App::Ready(game) = self {
+            game.exiting(event_loop);
+        }
+    }
+}
+
+/// The ordinary launch: load the resources on a worker while the window shows
+/// the loading screen, then swap in the game on the main thread.
+fn run_loading(
+    options: Options,
+    settings: Settings,
+    vanilla_root: PathBuf,
+    pack_error: Option<String>,
+    started: Instant,
+) -> Result<()> {
+    let progress = Progress::new();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let loader = {
+        let progress = progress.clone();
+        let settings = settings.clone();
+        let vanilla_root = vanilla_root.clone();
+        let root = options.resources.clone();
+        std::thread::Builder::new()
+            .name("resource-loader".into())
+            .spawn(move || {
+                let result = load_resources(root, &vanilla_root, &settings, started, &|stage| {
+                    progress.set(stage)
+                })
+                .map_err(|e| e.to_string());
+                let _ = sender.send(result);
+            })?
+    };
+    let atlas = HudAtlas::build(&options.resources).ok();
+    let loading = Loading {
+        window: None,
+        renderer: None,
+        atlas,
+        settings,
+        fullscreen: horizon_client::window::FullscreenState::new(false),
+        options: Some(options),
+        vanilla_root,
+        pack_error,
+        started,
+        progress,
+        receiver,
+        loaded: None,
+        handle: Some(loader),
+        shown: false,
+        error: None,
+    };
+    let mut app = App::Loading(Box::new(loading));
+    EventLoop::new()?.run_app(&mut app)?;
+    match app {
+        App::Ready(mut game) => {
+            write_report(&game)?;
+            if let Some(e) = game.error.take() {
+                return Err(e);
+            }
+        }
+        App::Loading(loading) => {
+            if let Some(e) = loading.error {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn run() -> Result<()> {
+    let Some(mut options) = Options::read()? else {
+        return Ok(());
+    };
+    if options.dedicated.is_some() && !dedicated::preflight(&mut options)? {
+        return Ok(());
+    }
+    let started = Instant::now();
+    horizon_client::spans::enable(options.spikes.is_some());
+    let vanilla_root = options.resources.clone();
+    let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    // Snapshots of derived tables live in the game folder, never beside the
+    // shared resources.
+    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    let mut pack_error = None;
+    options.resources = packs::startup_root(&vanilla_root, &early_settings.resource_packs)
+        .unwrap_or_else(|e| {
+            log::warn!("Horizon: resource packs not applied: {e}");
+            pack_error = Some(e.to_string());
+            vanilla_root.clone()
+        });
+    options.resources = mods::content_root(
+        &options.resources,
+        &early_settings.mods.enabled,
+        &options.dev_mods,
+    );
+    // Harnesses and dedicated runs stay synchronous; a normal launch enters
+    // the event loop at once and loads the resources on a worker.
+    if !synchronous_startup(&options) {
+        return run_loading(options, early_settings, vanilla_root, pack_error, started);
+    }
+    let loaded = load_resources(
+        options.resources.clone(),
+        &vanilla_root,
+        &early_settings,
+        started,
+        &|_| {},
+    )?;
+    options.resources = loaded.root.clone();
+    let audio = if options.dedicated.is_some() {
+        Audio::silent(&options.resources)
+    } else {
+        Audio::new(&options.resources)
+    };
+    let resources = Arc::new(loaded.resources);
+    let game = start_game(
+        &resources,
+        loaded.pack,
+        loaded.gui,
+        options,
+        loaded.pack_error.or(pack_error),
+        audio,
+        vanilla_root,
+        started,
+    )?;
+    if let Some(game) = game {
+        run_event_loop(game)?;
     }
     Ok(())
 }
