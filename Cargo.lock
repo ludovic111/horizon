@@ -1432,6 +1432,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-shaders"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+ "zip",
+]
+
+[[package]]
 name = "horizon-telemetry"
 version = "0.1.0"
 dependencies = [
