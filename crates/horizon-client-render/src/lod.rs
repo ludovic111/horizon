@@ -47,6 +47,9 @@ fn meshing_threads(cores: usize) -> usize {
 /// terrain starts one sample job at most this often and no detail: it would
 /// otherwise take the cores the near chunks and the frame need.
 const HELD_SAMPLE_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a tile whose sampling failed (`LodSampler::grid` gave no
+/// columns: a server refused or lost it) waits before it is asked again.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 /// The coarsest tile level: `Plan` roots cover at most `MAX_CHUNKS` chunks
 /// around (a level-22 tile is 67 million blocks wide: the whole world).
 pub(crate) const MAX_LEVEL: u8 = 22;
@@ -843,6 +846,8 @@ pub struct Lod {
     near_loading: bool,
     /// When `request_samples` last started a job while held.
     held_sample_at: std::time::Instant,
+    /// Tiles whose sampling failed, and when they may be asked again.
+    retry: FxHashMap<TileKey, std::time::Instant>,
     /// Each tile's samples, shared with mesh jobs in flight.
     ready: FxHashMap<TileKey, Arc<Vec<Column>>>,
     /// Fully covered subtrees, by tile.
@@ -1179,6 +1184,7 @@ impl Lod {
             sample_jobs: SAMPLE_JOBS.max(sampling_threads(cores) + 1),
             near_loading: false,
             held_sample_at: std::time::Instant::now(),
+            retry: FxHashMap::default(),
             ready: FxHashMap::default(),
             complete: FxHashMap::default(),
             active: FxHashSet::default(),
@@ -1609,7 +1615,16 @@ impl Lod {
     }
     fn finish_sample(&mut self, key: TileKey, samples: Vec<Column>) {
         self.pending.remove(&key);
-        if self.plan.nodes.contains(&key) && samples.len() == CELLS * CELLS {
+        if samples.len() != CELLS * CELLS {
+            let now = std::time::Instant::now();
+            if self.retry.len() > 4096 {
+                self.retry.retain(|_, at| *at > now);
+            }
+            self.retry.insert(key, now + RETRY);
+            return;
+        }
+        self.retry.remove(&key);
+        if self.plan.nodes.contains(&key) {
             let mut samples = samples;
             if let (Some(old), Some(mask)) = (self.ready.get(&key), self.detail_masks.get(&key)) {
                 for i in 0..256 {
@@ -2161,8 +2176,16 @@ impl Lod {
         if free == 0 {
             return;
         }
+        let now = std::time::Instant::now();
         if self.held() {
-            self.held_sample_at = std::time::Instant::now();
+            self.held_sample_at = now;
+        }
+        // A tile whose sampling failed waits out `RETRY`; once it has, the
+        // queue is rebuilt so the tile is asked again.
+        let retrying = self.retry.len();
+        self.retry.retain(|_, at| *at > now);
+        if self.retry.len() != retrying {
+            self.wanted_stale = true;
         }
         // The queue is rebuilt when the view moves a chunk, not scanned and
         // sorted on every frame.
@@ -2189,6 +2212,7 @@ impl Lod {
                 || self.ready.contains_key(&key)
                 || self.plan.split.contains(&key)
                 || !self.plan.nodes.contains(&key)
+                || self.retry.contains_key(&key)
             {
                 continue;
             }
@@ -2204,7 +2228,10 @@ impl Lod {
     fn rebuild_wanted(&mut self, camera: [i32; 2]) {
         self.wanted.clear();
         for &key in &self.plan.nodes {
-            if self.plan.split.contains(&key) || self.ready.contains_key(&key) {
+            if self.plan.split.contains(&key)
+                || self.ready.contains_key(&key)
+                || self.retry.contains_key(&key)
+            {
                 continue;
             }
             self.wanted.push(std::cmp::Reverse(Wanted {
